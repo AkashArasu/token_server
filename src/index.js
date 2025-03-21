@@ -38,6 +38,6 @@ export default {
 			}
 		}
 
-		return new Response('Hello World!');
+		return new Response('Hello this service is working');
 	},
 };
