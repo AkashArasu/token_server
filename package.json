@@ -12,5 +12,9 @@
 		"@cloudflare/vitest-pool-workers": "^0.7.5",
 		"vitest": "~3.0.7",
 		"wrangler": "^3.114.1"
+	},
+	"type": "module",
+	"dependencies": {
+		"@stream-io/node-sdk": "^0.4.18"
 	}
 }

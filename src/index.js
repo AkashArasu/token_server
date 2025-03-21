@@ -8,8 +8,36 @@
  * Learn more at https://developers.cloudflare.com/workers/
  */
 
+import { StreamClient } from "@stream-io/node-sdk";
+
 export default {
 	async fetch(request, env, ctx) {
+
+		const client = new StreamClient(env.STREAM_API_KEY, env.STREAM_API_SECRET);
+
+		const url = new URL(request.url);
+
+		if (url.pathname === '/token' && request.method === 'POST' && request.headers.get('Content-Type') === 'application/json') {
+			try {
+				const body = await request.json();
+
+				if (!body || typeof body !== 'object' || !body.hasOwnProperty('userId')) {
+                    throw new Error("Invalid request body: 'userId' is required.");
+                }
+
+                const userId = body["userId"];
+                if (typeof userId !== 'string') {
+                    throw new Error("Invalid 'userId': must be a string.");
+                }
+
+				const token = client.generateUserToken({ userId: userId });
+				
+				return new Response(token, { headers: { 'Content-Type': 'text/plain' }, status: 200 });
+			} catch (error) {
+				return new Response(JSON.stringify({ error: error.message }), { headers: { 'Content-Type': 'application/json' }, status: 400 });
+			}
+		}
+
 		return new Response('Hello World!');
 	},
 };
