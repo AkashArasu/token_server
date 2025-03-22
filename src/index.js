@@ -32,13 +32,39 @@ export default {
                 // }
 
 				const token = client.generateUserToken({ user_id: userId });
+
+				const response = new Response(token, { headers: { 'Content-Type': 'text/plain' }, status: 200 });
 				
-				return new Response(token, { headers: { 'Content-Type': 'text/plain' }, status: 200 }).headers.set('Access-Control-Allow-Origin', '*');
+				return handleCORS(request, response);
 			} catch (error) {
-				return new Response(JSON.stringify({ error: error.message }), { headers: { 'Content-Type': 'application/json' }, status: 400 }).headers.set('Access-Control-Allow-Origin', '*');
+				const response = new Response(JSON.stringify({ error: error.message }), { headers: { 'Content-Type': 'application/json' }, status: 400 });
+				return handleCORS(request, response);
 			}
 		}
 
-		return new Response('Hello this service is working').headers.set('Access-Control-Allow-Origin', '*');
+		const response = new Response('Hello this service is working');
+		return handleCORS(request, response);
 	},
 };
+
+function handleCORS(request, response) {
+	// Allow all origins - more permissive
+	response.headers.set('Access-Control-Allow-Origin', '*');
+	
+	// Include all requested headers in preflight response
+	const requestHeaders = request.headers.get('Access-Control-Request-Headers');
+	if (requestHeaders) {
+	  response.headers.set('Access-Control-Allow-Headers', requestHeaders);
+	} else {
+	  response.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+	}
+	
+	// Allow all common methods
+	response.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+	
+	// Allow credentials
+	response.headers.set('Access-Control-Allow-Credentials', 'true');
+
+	
+	return response;
+  }
