@@ -33,12 +33,12 @@ export default {
 
 				const token = client.generateUserToken({ user_id: userId });
 				
-				return new Response(token, { headers: { 'Content-Type': 'text/plain' }, status: 200 });
+				return new Response(token, { headers: { 'Content-Type': 'text/plain' }, status: 200 }).headers.set('Access-Control-Allow-Origin', '*');
 			} catch (error) {
-				return new Response(JSON.stringify({ error: error.message }), { headers: { 'Content-Type': 'application/json' }, status: 400 });
+				return new Response(JSON.stringify({ error: error.message }), { headers: { 'Content-Type': 'application/json' }, status: 400 }).headers.set('Access-Control-Allow-Origin', '*');
 			}
 		}
 
-		return new Response('Hello this service is working');
+		return new Response('Hello this service is working').headers.set('Access-Control-Allow-Origin', '*');
 	},
 };
