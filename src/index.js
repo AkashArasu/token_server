@@ -17,18 +17,19 @@ export default {
 
 		const url = new URL(request.url);
 
-		if (url.pathname === '/token' && request.method === 'POST' && request.headers.get('Content-Type') === 'application/json') {
+		if (url.pathname === '/token') {
 			try {
 				const body = await request.json();
 
-				if (!body || typeof body !== 'object' || !body.hasOwnProperty('userId')) {
-                    throw new Error("Invalid request body: 'userId' is required.");
-                }
+				// if (!body || typeof body !== 'object' || !body.hasOwnProperty('userId')) {
+                //     throw new Error("Invalid request body: 'userId' is required.");
+					
+                // }
 
                 const userId = body["userId"];
-                if (typeof userId !== 'string') {
-                    throw new Error("Invalid 'userId': must be a string.");
-                }
+                // if (typeof userId !== 'string') {
+                //     throw new Error("Invalid 'userId': must be a string.");
+                // }
 
 				const token = client.generateUserToken({ userId: userId });
 				
