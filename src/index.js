@@ -31,7 +31,7 @@ export default {
                 //     throw new Error("Invalid 'userId': must be a string.");
                 // }
 
-				const token = client.generateUserToken({ userId: userId });
+				const token = client.generateUserToken({ user_id: userId });
 				
 				return new Response(token, { headers: { 'Content-Type': 'text/plain' }, status: 200 });
 			} catch (error) {
