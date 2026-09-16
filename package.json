@@ -9,12 +9,12 @@
 		"test": "vitest"
 	},
 	"devDependencies": {
-		"@cloudflare/vitest-pool-workers": "^0.7.5",
-		"vitest": "~3.0.7",
-		"wrangler": "^3.114.1"
+		"@cloudflare/vitest-plugin": "^1.1.6",
+		"vitest": "^4.1.0",
+		"wrangler": "^4.130.0"
 	},
 	"type": "module",
 	"dependencies": {
-		"@stream-io/node-sdk": "^0.4.18"
+		"@stream-io/node-sdk": "^0.8.6"
 	}
 }
