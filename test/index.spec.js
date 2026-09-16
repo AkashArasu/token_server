@@ -88,6 +88,7 @@ describe('PropertyCallCoordinator reliability', () => {
     expect(first.status).toBe(200);
     const firstCall = await first.json();
     expect(firstCall.status).toBe('ringing');
+    expect(firstCall.sessionToken).toBe('visitor-secret-1');
 
     const retry = await internalPost(
       harness.coordinator,

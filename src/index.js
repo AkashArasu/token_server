@@ -88,7 +88,10 @@ export class PropertyCallCoordinator {
     call.updatedAt = Date.now();
     await this.state.storage.put('call', call);
     await this.state.storage.setAlarm(Date.now() + RING_TIMEOUT_MS);
-    return json(publicCall(call));
+    // `/init` is an internal Worker-to-Durable-Object call. Keep the visitor
+    // capability here so createVisitorSession can return it to the same
+    // visitor; only the public Worker response strips it via publicCall().
+    return json(call);
   }
   async transition(call, { action, actor, sessionToken }) {
     const isHomeowner = actor === `homeowner:${call.homeownerUid}`;
