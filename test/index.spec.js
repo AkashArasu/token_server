@@ -9,6 +9,7 @@ function coordinatorHarness({ transientUpsertFailures = 0 } = {}) {
   const alarms = [];
   const sockets = [];
   let upsertAttempts = 0;
+  let createdCallRequest;
   const streamClient = {
     async upsertUsers() {
       upsertAttempts += 1;
@@ -20,7 +21,7 @@ function coordinatorHarness({ transientUpsertFailures = 0 } = {}) {
     },
     video: {
       call: () => ({
-        getOrCreate: async () => ({}),
+        getOrCreate: async request => { createdCallRequest = request; return {}; },
         end: async () => ({}),
       }),
     },
@@ -45,6 +46,7 @@ function coordinatorHarness({ transientUpsertFailures = 0 } = {}) {
     alarms,
     sockets,
     get upsertAttempts() { return upsertAttempts; },
+    get createdCallRequest() { return createdCallRequest; },
   };
 }
 
@@ -83,6 +85,14 @@ describe('QRinger signaling worker', () => {
     const response = await worker.fetch(new Request('https://example.com/token', { method: 'POST' }), env, context);
     await waitOnExecutionContext(context);
     expect(response.status).toBe(404);
+  });
+
+  it('does not expose homeowner call state without Firebase authentication', async () => {
+    const response = await worker.fetch(new Request(
+      'https://example.com/v1/homeowner/calls/call-1',
+      { headers: { 'X-Property-Id': 'a'.repeat(20) } },
+    ), env);
+    expect(response.status).toBe(401);
   });
 
   it('rejects unsigned Stream webhooks and applies a signed call-ended event', async () => {
@@ -261,6 +271,36 @@ describe('PropertyCallCoordinator reliability', () => {
     await internalPost(harness.coordinator, '/init', newCall());
     await harness.coordinator.alarm();
     expect(harness.values.get('call').status).toBe('no_answer');
+  });
+
+  it('keeps Stream and Worker ringing windows aligned at 30 seconds', async () => {
+    const harness = coordinatorHarness();
+    await internalPost(harness.coordinator, '/init', newCall());
+    expect(harness.createdCallRequest.data.settings_override.ring).toEqual({
+      auto_cancel_timeout_ms: 30000,
+      incoming_call_timeout_ms: 30000,
+      missed_call_timeout_ms: 30000,
+    });
+  });
+
+  it('broadcasts a native Reject as declined but never turns cancellation into a miss', async () => {
+    const harness = coordinatorHarness();
+    await internalPost(harness.coordinator, '/init', newCall());
+    const rejected = await internalPost(harness.coordinator, '/transition', {
+      callId: 'call-1', action: 'reject', actor: 'homeowner:firebase-home-1',
+    });
+    expect((await rejected.json()).status).toBe('declined');
+    await harness.coordinator.alarm();
+    expect(harness.values.get('call').status).toBe('declined');
+
+    await internalPost(harness.coordinator, '/init',
+      newCall({ callId: 'call-2', requestId: 'next_request_123456' }));
+    const cancelled = await internalPost(harness.coordinator, '/transition', {
+      callId: 'call-2', action: 'cancel', actor: 'visitor', sessionToken: 'visitor-secret-1',
+    });
+    expect((await cancelled.json()).status).toBe('cancelled');
+    await harness.coordinator.alarm();
+    expect(harness.values.get('call').status).toBe('cancelled');
   });
 
   it('retries transient Stream failures before ringing', async () => {

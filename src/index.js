@@ -25,6 +25,9 @@ export default {
         const body = await request.json().catch(() => ({}));
         response = await homeownerSession(homeowner, body, env);
       }
+      else if (/^\/v1\/homeowner\/calls\/[^/]+$/.test(path) && request.method === 'GET') {
+        response = await homeownerCallState(path.split('/')[4], request, env);
+      }
       else if (path === '/v1/homeowner/property/regenerate' && request.method === 'POST') response = await regenerateProperty(await requireHomeowner(request, env), env);
       else if (path === '/v1/visitor-sessions' && request.method === 'POST') {
         const body = await request.json().catch(() => { throw httpError(400, 'invalid_request'); });
@@ -250,6 +253,17 @@ async function callEvents(callId, request, env) {
   return json(publicCall(state));
 }
 
+async function homeownerCallState(callId, request, env) {
+  const homeowner = await requireHomeowner(request, env);
+  const propertyId = request.headers.get('X-Property-Id');
+  if (!propertyId || !/^[a-f0-9]{20}$/.test(propertyId)) throw httpError(400, 'invalid_property');
+  const response = await env.PROPERTY_CALLS.get(env.PROPERTY_CALLS.idFromName(propertyId)).fetch('https://call/state');
+  if (!response.ok) throw httpError(404, 'call_not_found');
+  const call = await response.json();
+  if (call.callId !== callId || call.homeownerUid !== homeowner.uid) throw httpError(404, 'call_not_found');
+  return json(publicCall(call));
+}
+
 async function abandonVisitorSession(body, env) {
   if (typeof body?.propertyId !== 'string' || !/^[a-f0-9]{20}$/.test(body.propertyId) ||
       typeof body.requestId !== 'string' || !/^[a-zA-Z0-9_-]{16,80}$/.test(body.requestId)) {
@@ -338,6 +352,13 @@ async function createStreamCall(env, call) {
       // the intended callee.
       created_by_id: call.visitorId,
       members: [{ user_id: call.visitorId }, { user_id: call.homeownerStreamId }],
+      settings_override: {
+        ring: {
+          auto_cancel_timeout_ms: RING_TIMEOUT_MS,
+          incoming_call_timeout_ms: RING_TIMEOUT_MS,
+          missed_call_timeout_ms: RING_TIMEOUT_MS,
+        },
+      },
       custom: { qringer: true, property_id: call.propertyId },
     },
   }));
