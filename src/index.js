@@ -3,6 +3,10 @@ const RING_TIMEOUT_MS = 30_000;
 const ACCEPTED_CALL_SAFETY_TIMEOUT_MS = 60 * 60 * 1000;
 const STALE_RING_GRACE_MS = 10_000;
 const STREAM_OPERATION_ATTEMPTS = 3;
+const CALL_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
+const ABANDONED_REQUEST_WINDOW_MS = 60_000;
+const MAX_CALL_ATTEMPTS_PER_SOURCE = 20;
+const MAX_CALL_ATTEMPTS_PER_PROPERTY = 60;
 const TERMINAL_STATES = new Set(['declined', 'busy', 'no_answer', 'cancelled', 'ended']);
 
 export default {
@@ -14,6 +18,7 @@ export default {
       const path = url.pathname;
       let response;
       if (path === '/health') response = json({ ok: true });
+      else if (path === '/v1/stream/webhook' && request.method === 'POST') response = await streamWebhook(request, env);
       else if (path === '/v1/homeowner/profile' && request.method === 'POST') response = await createOrGetProperty(await requireHomeowner(request, env), env);
       else if (path === '/v1/homeowner/session' && request.method === 'POST') {
         const homeowner = await requireHomeowner(request, env);
@@ -23,16 +28,26 @@ export default {
       else if (path === '/v1/homeowner/property/regenerate' && request.method === 'POST') response = await regenerateProperty(await requireHomeowner(request, env), env);
       else if (path === '/v1/visitor-sessions' && request.method === 'POST') {
         const body = await request.json().catch(() => { throw httpError(400, 'invalid_request'); });
-        response = await createVisitorSession(body, env);
+        response = await createVisitorSession(body, env, request);
       }
-      else if (/^\/v1\/calls\/[^/]+\/events$/.test(path) && request.method === 'GET') response = await callEvents(path.split('/')[3], request, env);
+      else if (path === '/v1/visitor-sessions/abandon' && request.method === 'POST') {
+        response = await abandonVisitorSession(await request.json().catch(() => ({})), env);
+      }
+      else if (/^\/v1\/calls\/[^/]+\/events$/.test(path) && request.method === 'GET') {
+        if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+          return await subscribeCall(path.split('/')[3], request, env);
+        }
+        response = await callEvents(path.split('/')[3], request, env);
+      }
       else if (/^\/v1\/calls\/[^/]+\/(accept|reject|cancel|end)$/.test(path) && request.method === 'POST') {
         const [, callId, action] = path.match(/^\/v1\/calls\/([^/]+)\/(accept|reject|cancel|end)$/);
         response = await transitionCall(callId, action, request, env);
       } else response = json({ error: 'not_found' }, 404);
       return cors(response, env, origin);
     } catch (error) {
-      return cors(json({ error: error.message || 'internal_error' }, error.status || 500), env, origin);
+      const response = json({ error: error.message || 'internal_error' }, error.status || 500);
+      if (error.retryAfter) response.headers.set('Retry-After', error.retryAfter);
+      return cors(response, env, origin);
     }
   },
 };
@@ -42,15 +57,19 @@ export class PropertyCallCoordinator {
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === '/init') return this.init(await request.json());
+    if (url.pathname === '/abandon') return this.abandon(await request.json());
     const call = await this.state.storage.get('call');
     if (!call) return json({ error: 'call_not_found' }, 404);
     // This internal Durable Object endpoint is only reached through the Worker.
     // The Worker removes the visitor session secret before responding externally.
     if (url.pathname === '/state') return json(call);
+    if (url.pathname === '/subscribe') return this.subscribe(call, request);
     if (url.pathname === '/transition') return this.transition(call, await request.json());
+    if (url.pathname === '/webhook-end') return this.webhookEnd(call, await request.json());
     return json({ error: 'not_found' }, 404);
   }
   async init(input) {
+    const { sourceKey = 'unknown', ...callInput } = input;
     let active = await this.state.storage.get('call');
     // Calls created by the previous release did not record `acceptedAt`, and
     // its End transition was ignored.  Retire only those legacy orphaned calls
@@ -63,15 +82,26 @@ export class PropertyCallCoordinator {
     if (staleLegacyAccepted || staleAccepted || staleRinging) {
       active.status = staleRinging ? 'no_answer' : 'ended'; active.updatedAt = now;
       await this.state.storage.put('call', active);
+      this.broadcast(active);
       await endStreamCall(this.env, active);
     }
+    if (active?.requestId === input.requestId) return json(active);
+    const abandoned = ((await this.state.storage.get('abandoned')) || []).filter(entry => now - entry.at < ABANDONED_REQUEST_WINDOW_MS);
+    if (abandoned.some(entry => entry.requestId === input.requestId)) return json({ error: 'visitor_left' }, 410);
     if (active && !TERMINAL_STATES.has(active.status)) {
-      // Retrying the same browser request after a lost response must return
-      // the original credentials rather than report the homeowner as Busy.
-      if (input.requestId && active.requestId === input.requestId) return json(active);
       return json({ status: 'busy', callId: active.callId }, 409);
     }
-    const call = { ...input, status: 'calling', createdAt: now, updatedAt: now };
+    const attempts = ((await this.state.storage.get('attempts')) || []).filter(entry => now - entry.at < CALL_ATTEMPT_WINDOW_MS);
+    const sourceAttempts = attempts.filter(entry => entry.sourceKey === sourceKey);
+    if (attempts.length >= MAX_CALL_ATTEMPTS_PER_PROPERTY || sourceAttempts.length >= MAX_CALL_ATTEMPTS_PER_SOURCE) {
+      const response = json({ error: 'rate_limited' }, 429);
+      const oldest = sourceAttempts.length >= MAX_CALL_ATTEMPTS_PER_SOURCE ? sourceAttempts[0] : attempts[0];
+      response.headers.set('Retry-After', String(Math.ceil((CALL_ATTEMPT_WINDOW_MS - (now - oldest.at)) / 1000)));
+      return response;
+    }
+    attempts.push({ at: now, sourceKey });
+    await this.state.storage.put('attempts', attempts);
+    const call = { ...callInput, status: 'calling', createdAt: now, updatedAt: now };
     await this.state.storage.put('call', call);
     // Cover the small crash window between persisting `calling` and receiving
     // Stream's response. A later alarm can always release the property.
@@ -82,18 +112,41 @@ export class PropertyCallCoordinator {
       call.status = 'ended'; call.updatedAt = Date.now();
       await this.state.storage.put('call', call);
       await this.state.storage.deleteAlarm();
+      this.broadcast(call);
       throw error;
     }
     call.status = 'ringing';
     call.updatedAt = Date.now();
     await this.state.storage.put('call', call);
     await this.state.storage.setAlarm(Date.now() + RING_TIMEOUT_MS);
+    this.broadcast(call);
     // `/init` is an internal Worker-to-Durable-Object call. Keep the visitor
     // capability here so createVisitorSession can return it to the same
     // visitor; only the public Worker response strips it via publicCall().
     return json(call);
   }
-  async transition(call, { action, actor, sessionToken }) {
+  async abandon({ requestId }) {
+    const now = Date.now();
+    const active = await this.state.storage.get('call');
+    if (active?.requestId === requestId) {
+      if (!TERMINAL_STATES.has(active.status)) {
+        active.status = active.status === 'accepted' ? 'ended' : 'cancelled';
+        active.updatedAt = now;
+        await this.state.storage.put('call', active);
+        await this.state.storage.deleteAlarm();
+        this.broadcast(active);
+        await endStreamCall(this.env, active);
+      }
+      return json({ ok: true });
+    }
+    const abandoned = ((await this.state.storage.get('abandoned')) || [])
+      .filter(entry => now - entry.at < ABANDONED_REQUEST_WINDOW_MS && entry.requestId !== requestId);
+    abandoned.push({ requestId, at: now });
+    await this.state.storage.put('abandoned', abandoned.slice(-64));
+    return json({ ok: true });
+  }
+  async transition(call, { callId, action, actor, sessionToken }) {
+    if (callId && callId !== call.callId) return json({ error: 'call_not_found' }, 404);
     const isHomeowner = actor === `homeowner:${call.homeownerUid}`;
     const isVisitor = actor === 'visitor' && sessionToken === call.sessionToken;
     if (!isHomeowner && !isVisitor) return json({ error: 'forbidden' }, 403);
@@ -107,11 +160,42 @@ export class PropertyCallCoordinator {
     if (call.status === 'accepted') call.acceptedAt = Date.now();
     call.updatedAt = Date.now();
     await this.state.storage.put('call', call);
+    this.broadcast(call);
     if (call.status === 'accepted') {
       await this.state.storage.setAlarm(call.acceptedAt + ACCEPTED_CALL_SAFETY_TIMEOUT_MS);
     } else if (TERMINAL_STATES.has(call.status)) {
       await this.state.storage.deleteAlarm(); await endStreamCall(this.env, call);
     }
+    return json(publicCall(call));
+  }
+  subscribe(call, request) {
+    const token = request.headers.get('X-Visitor-Session');
+    const callId = new URL(request.url).searchParams.get('callId');
+    if (token !== call.sessionToken || callId !== call.callId) return json({ error: 'forbidden' }, 403);
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    this.state.acceptWebSocket(server);
+    server.serializeAttachment({ callId });
+    server.send(JSON.stringify(publicCall(call)));
+    return new Response(null, { status: 101, webSocket: client, headers: { 'Sec-WebSocket-Protocol': 'qronly.v1' } });
+  }
+  broadcast(call) {
+    for (const socket of this.state.getWebSockets?.() || []) {
+      if (socket.deserializeAttachment()?.callId !== call.callId) continue;
+      try { socket.send(JSON.stringify(publicCall(call))); } catch (_) { /* Fallback polling handles a disconnected client. */ }
+      if (TERMINAL_STATES.has(call.status)) {
+        try { socket.close(1000, 'call ended'); } catch (_) {}
+      }
+    }
+  }
+  async webhookEnd(call, { callId, type }) {
+    if (call.callId !== callId) return json({ error: 'call_not_found' }, 404);
+    if (TERMINAL_STATES.has(call.status) || (type === 'call.session_ended' && call.status !== 'accepted')) return json(publicCall(call));
+    call.status = 'ended';
+    call.updatedAt = Date.now();
+    await this.state.storage.put('call', call);
+    await this.state.storage.deleteAlarm();
+    this.broadcast(call);
     return json(publicCall(call));
   }
   async alarm() {
@@ -125,12 +209,14 @@ export class PropertyCallCoordinator {
       call.status = 'no_answer';
     } else return;
     call.updatedAt = Date.now();
-    await this.state.storage.put('call', call); await endStreamCall(this.env, call);
+    await this.state.storage.put('call', call);
+    this.broadcast(call);
+    await endStreamCall(this.env, call);
   }
 }
 
-async function createVisitorSession(body, env) {
-  if (!body?.propertyId || typeof body.propertyId !== 'string') throw httpError(400, 'invalid_property');
+async function createVisitorSession(body, env, request) {
+  if (typeof body?.propertyId !== 'string' || !/^[a-f0-9]{20}$/.test(body.propertyId)) throw httpError(400, 'invalid_property');
   const requestId = typeof body.requestId === 'string' && /^[a-zA-Z0-9_-]{16,80}$/.test(body.requestId) ? body.requestId : crypto.randomUUID().replaceAll('-', '');
   const property = await env.DB.prepare('SELECT public_id, homeowner_uid, homeowner_stream_id, homeowner_name FROM properties WHERE public_id = ? AND revoked_at IS NULL').bind(body.propertyId).first();
   if (!property) throw httpError(404, 'property_not_found');
@@ -138,8 +224,15 @@ async function createVisitorSession(body, env) {
   const visitorId = `visitor_${crypto.randomUUID().replaceAll('-', '')}`;
   const sessionToken = crypto.randomUUID().replaceAll('-', '');
   const stub = env.PROPERTY_CALLS.get(env.PROPERTY_CALLS.idFromName(property.public_id));
-  const initial = await stub.fetch('https://call/init', { method: 'POST', body: JSON.stringify({ callId, requestId, propertyId: property.public_id, homeownerUid: property.homeowner_uid, homeownerStreamId: property.homeowner_stream_id, homeownerName: property.homeowner_name || 'Homeowner', visitorId, sessionToken }) });
+  const sourceKey = await sourceFingerprint(request.headers.get('CF-Connecting-IP'), env);
+  const initial = await stub.fetch('https://call/init', { method: 'POST', body: JSON.stringify({ callId, requestId, propertyId: property.public_id, homeownerUid: property.homeowner_uid, homeownerStreamId: property.homeowner_stream_id, homeownerName: property.homeowner_name || 'Homeowner', visitorId, sessionToken, sourceKey }) });
   if (initial.status === 409) throw httpError(409, 'busy');
+  if (initial.status === 410) throw httpError(410, 'visitor_left');
+  if (initial.status === 429) {
+    const error = httpError(429, 'rate_limited');
+    error.retryAfter = initial.headers.get('Retry-After');
+    throw error;
+  }
   if (!initial.ok) throw httpError(initial.status, 'call_creation_failed');
   const state = await initial.json();
   const streamToken = (await stream(env)).generateCallToken({ user_id: state.visitorId, call_cids: [`${CALL_TYPE}:${state.callId}`], validity_in_seconds: 3600 });
@@ -157,12 +250,53 @@ async function callEvents(callId, request, env) {
   return json(publicCall(state));
 }
 
+async function abandonVisitorSession(body, env) {
+  if (typeof body?.propertyId !== 'string' || !/^[a-f0-9]{20}$/.test(body.propertyId) ||
+      typeof body.requestId !== 'string' || !/^[a-zA-Z0-9_-]{16,80}$/.test(body.requestId)) {
+    throw httpError(400, 'invalid_request');
+  }
+  return env.PROPERTY_CALLS.get(env.PROPERTY_CALLS.idFromName(body.propertyId)).fetch('https://call/abandon', {
+    method: 'POST', body: JSON.stringify({ requestId: body.requestId }),
+  });
+}
+
+async function subscribeCall(callId, request, env) {
+  const origin = request.headers.get('Origin');
+  if (!allowedVisitorOrigin(env, origin)) throw httpError(403, 'forbidden_origin');
+  const propertyId = new URL(request.url).searchParams.get('propertyId');
+  const protocols = (request.headers.get('Sec-WebSocket-Protocol') || '').split(',').map(value => value.trim());
+  const tokenProtocol = protocols.find(value => /^session\.[a-f0-9]{32}$/.test(value));
+  if (!propertyId || !tokenProtocol || !protocols.includes('qronly.v1')) throw httpError(401, 'missing_session');
+  return env.PROPERTY_CALLS.get(env.PROPERTY_CALLS.idFromName(propertyId)).fetch(
+    `https://call/subscribe?callId=${encodeURIComponent(callId)}`,
+    { headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': 'qronly.v1', 'X-Visitor-Session': tokenProtocol.slice('session.'.length) } },
+  );
+}
+
+async function streamWebhook(request, env) {
+  const signature = request.headers.get('X-Signature');
+  if (!signature || !env.STREAM_API_SECRET) throw httpError(401, 'invalid_signature');
+  const rawBody = await request.text();
+  let event;
+  try { event = (await stream(env)).verifyAndParseWebhook(rawBody, signature); }
+  catch (_) { throw httpError(401, 'invalid_signature'); }
+  if (event.type !== 'call.ended' && event.type !== 'call.session_ended') return json({ ok: true });
+  const propertyId = event.call?.custom?.property_id;
+  const callId = event.call?.id || event.call_cid?.split(':').slice(1).join(':');
+  if (typeof propertyId !== 'string' || !/^[a-f0-9]{20}$/.test(propertyId) || !callId) return json({ ok: true });
+  const result = await env.PROPERTY_CALLS.get(env.PROPERTY_CALLS.idFromName(propertyId)).fetch('https://call/webhook-end', {
+    method: 'POST', body: JSON.stringify({ callId, type: event.type }),
+  });
+  if (!result.ok && result.status !== 404) throw httpError(503, 'webhook_processing_failed');
+  return json({ ok: true });
+}
+
 async function transitionCall(callId, action, request, env) {
   const body = await request.json().catch(() => ({})); const propertyId = request.headers.get('X-Property-Id') || body.propertyId;
   if (!propertyId) throw httpError(400, 'missing_property');
   let actor = 'visitor';
   try { actor = `homeowner:${(await requireHomeowner(request, env)).uid}`; } catch (error) { if (action === 'accept' || action === 'reject') throw error; }
-  const response = await env.PROPERTY_CALLS.get(env.PROPERTY_CALLS.idFromName(propertyId)).fetch('https://call/transition', { method: 'POST', body: JSON.stringify({ action, actor, sessionToken: request.headers.get('X-Visitor-Session') || body.sessionToken }) });
+  const response = await env.PROPERTY_CALLS.get(env.PROPERTY_CALLS.idFromName(propertyId)).fetch('https://call/transition', { method: 'POST', body: JSON.stringify({ callId, action, actor, sessionToken: request.headers.get('X-Visitor-Session') || body.sessionToken }) });
   return new Response(response.body, { status: response.status, headers: response.headers });
 }
 
@@ -204,7 +338,7 @@ async function createStreamCall(env, call) {
       // the intended callee.
       created_by_id: call.visitorId,
       members: [{ user_id: call.visitorId }, { user_id: call.homeownerStreamId }],
-      custom: { qringer: true },
+      custom: { qringer: true, property_id: call.propertyId },
     },
   }));
 }
@@ -271,6 +405,12 @@ async function firebaseJwk(kid) {
   }
 }
 function publicCall(call) { const { sessionToken, requestId, ...safe } = call; return safe; }
+async function sourceFingerprint(address, env) {
+  if (!address) return 'unknown';
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.STREAM_API_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const digest = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(address));
+  return Array.from(new Uint8Array(digest).slice(0, 16), byte => byte.toString(16).padStart(2, '0')).join('');
+}
 function randomPublicId() { return crypto.randomUUID().replaceAll('-', '').slice(0, 20); }
 function homeownerName(value, fallback) {
   const candidate = typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
@@ -278,7 +418,10 @@ function homeownerName(value, fallback) {
   return typeof fallback === 'string' && fallback.trim() ? fallback.trim().slice(0, 80) : 'Homeowner';
 }
 function json(body, status = 200) { return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } }); }
-function cors(response, env, origin) { if (origin && origin === env.VISITOR_WEB_ORIGIN) response.headers.set('Access-Control-Allow-Origin', origin); response.headers.set('Vary', 'Origin'); response.headers.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Property-Id, X-Visitor-Session'); response.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS'); return response; }
+function allowedVisitorOrigin(env, origin) {
+  return !!origin && [env.VISITOR_WEB_ORIGIN, ...(env.VISITOR_WEB_ORIGINS || '').split(',').map(value => value.trim())].includes(origin);
+}
+function cors(response, env, origin) { if (allowedVisitorOrigin(env, origin)) response.headers.set('Access-Control-Allow-Origin', origin); response.headers.set('Vary', 'Origin'); response.headers.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-Property-Id, X-Visitor-Session'); response.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS'); return response; }
 function httpError(status, message) { const error = new Error(message); error.status = status; return error; }
 function atobUrl(value) {
   // JWT header, payload, and signature segments use unpadded base64url.
